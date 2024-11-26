@@ -9,12 +9,28 @@ from selenium.webdriver.support import expected_conditions as EC
 from io import BytesIO
 from bs4 import BeautifulSoup
 import requests
+import os
 
 app = Flask(__name__)
-app.secret_key = 'your_secret_key'  # Needed for flashing messages
+app.secret_key = os.getenv('FLASK_SECRET_KEY', 'default_secret_key')  # Dynamic secret key
 
 # Global driver instance to maintain the session across requests
 driver = None
+
+# Function to initialize WebDriver
+def initialize_driver():
+    global driver
+    if driver is None:
+        try:
+            chrome_options = ChromeOptions()
+            chrome_options.add_argument("--headless")  # Run in headless mode (no UI)
+            chrome_options.add_argument("--no-sandbox")
+            chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--disable-gpu")  # Prevent GPU errors in headless mode
+            driver = Chrome(options=chrome_options)
+            driver.maximize_window()
+        except Exception as e:
+            raise Exception(f"Error initializing WebDriver: {e}")
 
 # Route for the login page
 @app.route('/', methods=['GET', 'POST'])
@@ -25,18 +41,12 @@ def login():
         email = request.form['email']
         password = request.form['password']
 
-        # Initialize driver only if it's not already initialized
-        if driver is None:
-            try:
-                chrome_options = ChromeOptions()
-                chrome_options.add_argument("--headless")  # Run in headless mode (no UI)
-                chrome_options.add_argument("--no-sandbox")
-                chrome_options.add_argument("--disable-dev-shm-usage")
-                driver = Chrome(options=chrome_options)
-                driver.maximize_window()
-            except Exception as e:
-                flash(f"Error initializing web driver: {e}", 'error')
-                return redirect(url_for('login'))
+        # Initialize driver
+        try:
+            initialize_driver()
+        except Exception as e:
+            flash(f"{e}", 'error')
+            return redirect(url_for('login'))
 
         # Run Selenium logic to handle login and scraping
         result, df = login_and_scrape(email, password)
@@ -50,7 +60,6 @@ def login():
             return redirect(url_for('login'))
 
     return render_template('index.html')
-
 
 # Function to log in and scrape data
 def login_and_scrape(email, password):
@@ -73,7 +82,9 @@ def login_and_scrape(email, password):
         )
         submit_button.click()
 
-        time.sleep(5)  # Wait for login to complete
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.XPATH, "//*[contains(text(), 'My Past Activities') or contains(text(), 'Wrong email or password')]"))
+        )
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         text = soup.get_text()
 
@@ -82,7 +93,6 @@ def login_and_scrape(email, password):
 
         if 'My Past Activities' in text:
             # Login successful, proceed to scrape
-            print('Login successful')
             data = scrape_data()
             return "success", data
 
@@ -92,25 +102,21 @@ def login_and_scrape(email, password):
         print(f"An error occurred during the login and scrape process: {e}")
         return "An error occurred. Please try again.", None
 
-
 # Function to scrape data after login
 def scrape_data():
     q_url = 'https://expert.chegg.com/qna/authoring/myanswers'
     driver.get(q_url)
     cooky = driver.get_cookies()
     cookie_string = "; ".join([f"{cookie['name']}={cookie['value']}" for cookie in cooky])
+
     try:
         p_url = 'https://expert-gateway.chegg.com/nestor-graph/graphql'
         headers = {
             "Host": "expert-gateway.chegg.com",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
             "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Referer": "https://expert.chegg.com/",
             "Content-Type": "application/json",
             "Authorization": "Basic alNNNG5iVHNXV0lHR2Y3OU1XVXJlQjA3YmpFeHJrRzM6SmQxbTVmd3o3aHRobnlCWg==",
-            "Origin": "https://expert.chegg.com",
             "Cookie": cookie_string,
         }
         form_d = {
@@ -122,46 +128,50 @@ def scrape_data():
                 "last": 20,
             },
         }
+
         res = requests.post(p_url, json=form_d, headers=headers)
         res.raise_for_status()
-        a = res.json()
-        b = a['data']['myAnswers']['edges']
-
+        data = res.json()
+        edges = data.get('data', {}).get('myAnswers', {}).get('edges', [])
         all_dicts = []
-        for i in b:
+
+        for edge in edges:
             try:
-                c = i['node']['question']['body']
-                s_c = BeautifulSoup(c, 'html.parser')
-                q_t = s_c.get_text(strip=True)
-                q_id = i['node']['question']['id']
-                dict_ = {'question': q_t, 'url': f'https://www.chegg.com/homework-help/questions-and-answers/q{q_id}'}
-                all_dicts.append(dict_)
+                question_body = edge['node']['question']['body']
+                question_id = edge['node']['question']['id']
+                soup = BeautifulSoup(question_body, 'html.parser')
+                question_text = soup.get_text(strip=True)
+                all_dicts.append({
+                    'question': question_text,
+                    'url': f'https://www.chegg.com/homework-help/questions-and-answers/q{question_id}',
+                })
             except Exception as e:
                 print(f"Error processing question: {e}")
                 continue
 
-        df = pd.DataFrame(all_dicts) if all_dicts else pd.DataFrame()
-        return df
+        return pd.DataFrame(all_dicts)
 
     except Exception as e:
         print(f"An error occurred: {e}")
         return pd.DataFrame()
 
-
 # Function to create Excel file from DataFrame
 def create_excel_file(df):
     output = BytesIO()
+    if df.empty:
+        df = pd.DataFrame({'Message': ['No data available']})
     df.to_excel(output, index=False)
     output.seek(0)
     return output
-
 
 # Ensure proper cleanup when the app is stopped
 @app.teardown_appcontext
 def cleanup(exception=None):
     global driver
     if driver:
-        driver.quit()
-        driver = None
-
-
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        finally:
+            driver = None
