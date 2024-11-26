@@ -198,5 +198,4 @@ def cleanup(exception=None):
         driver.quit()
         driver = None
 
-if __name__ == '__main__':
-    app.run(debug=True)
+
